@@ -164,6 +164,10 @@ function smc(
                     W = op(*, op(-, θs[b], θs[a]), max_stretch*randn(rng)/sqrt(Np))
                     (log(rand(rng)), op(+, θs[i], W), 0.0)
                 end
+                futures = Future[] 
+                θps = eltype(θs)[]
+                lπps = Float64[]
+                i_list = Int[]
                 for i = 1:nparticles # non-ideal parallelism
                     alive[i] || continue
                     lprob, θp, logcorr = new_p[i]
@@ -172,18 +176,23 @@ function smc(
                     lπp < 0 && (!isfinite(lπp)) && continue
                     lM = min(lπp - lπs[i] + logcorr, 0.0)
                     if lprob < lM 
-                        Xp_future = Distributed.@spawnat :any cost(push_p(prior, θp.x))
-                        Xp = fetch(Xp_future)
-                        if flag
-                            Xp > ϵ && continue
-                        else
-                            Xp >= ϵ && continue
-                        end
-                        θs[i] = θp
-                        Xs[i] = Xp
-                        lπs[i] = lπp
-                        accepted += 1
+                        push!(futures,Distributed.@spawnat :any cost(push_p(prior, θp.x)))     
+                        push!(θps,θp)     
+                        push!(lπps,lπp)     
+                        push!(i_list,i)
                     end
+                end
+                Xps = fetch.(futures)
+                for (Xp,θp,lπp,i) in zip(Xps,θps,lπps,i_list)
+                    if flag
+                        Xp > ϵ && continue
+                    else
+                        Xp >= ϵ && continue
+                    end
+                    θs[i] = θp
+                    Xs[i] = Xp
+                    lπs[i] = lπp
+                    accepted += 1
                 end
             accepted[] >= mcmc_tol * nparticles && break
         end

@@ -38,6 +38,7 @@ function resample_residual(w::AbstractVector{<:Real}, num_particles::Integer) # 
     return indices
 end
 
+using Distributed
 """
 Adaptive SMC from P. Del Moral 2012, with Affine invariant proposal mechanism, faster that `AIS` for `ABC` targets.
 ```julia
@@ -116,13 +117,11 @@ function smc(
         3 * Np / (min(alpha, min_r_ess)),
     )
     nparticles >= min_nparticles || error("nparticles must be >= $min_nparticles.")
-    θs = [op(float, Particle(rand(rng, prior))) for i = 1:nparticles]
-    Xs = parallel ?
-        fetch.([
-        Threads.@spawn cost(push_p(prior, θs[$i].x)) for i = 1:nparticles]) :
-        [cost(push_p(prior, θs[i].x)) for i = 1:nparticles]
 
-    lπs = [logpdf(prior, push_p(prior, θs[i].x)) for i = 1:nparticles]
+    θs = [op(float, Particle(rand(rng, prior))) for i = 1:nparticles]
+    Xs = pmap(θ -> cost(push_p(prior, θ.x)),θs)
+    lπs = map(θ -> logpdf(prior, push_p(prior, θ.x)) ,θs)
+    alive = fill(true,nparticles)
     α = alpha
     ϵ = Inf
     alive = fill(true,nparticles)
@@ -153,7 +152,7 @@ function smc(
         end
 
         # Step 3 - MCMC
-        accepted = parallel ? Threads.Atomic{Int}(0) : 0
+        accepted = 0
         retry_N = 1 + mcmc_retrys
 
         for r = 1:retry_N
@@ -165,7 +164,7 @@ function smc(
                     W = op(*, op(-, θs[b], θs[a]), max_stretch*randn(rng)/sqrt(Np))
                     (log(rand(rng)), op(+, θs[i], W), 0.0)
                 end
-                @cthreads parallel for i = 1:nparticles # non-ideal parallelism
+                for i = 1:nparticles # non-ideal parallelism
                     alive[i] || continue
                     lprob, θp, logcorr = new_p[i]
                     isnothing(lprob) && continue
@@ -173,7 +172,8 @@ function smc(
                     lπp < 0 && (!isfinite(lπp)) && continue
                     lM = min(lπp - lπs[i] + logcorr, 0.0)
                     if lprob < lM 
-                        Xp = cost(push_p(prior, θp.x))
+                        Xp_future = Distributed.@spawnat :any cost(push_p(prior, θp.x))
+                        Xp = fetch(Xp_future)
                         if flag
                             Xp > ϵ && continue
                         else
@@ -182,11 +182,7 @@ function smc(
                         θs[i] = θp
                         Xs[i] = Xp
                         lπs[i] = lπp
-                        if parallel 
-                            Threads.atomic_add!(accepted, 1)
-                        else
-                            accepted += 1
-                        end
+                        accepted += 1
                     end
                 end
             accepted[] >= mcmc_tol * nparticles && break
